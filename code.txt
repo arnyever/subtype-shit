@@ -1,0 +1,171 @@
+const express = require('express');
+const multer = require('multer');
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const { addonBuilder } = require('stremio-addon-sdk');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+const PORT = process.env.PORT || 7000;
+const BASE_URL = process.env.BASE_URL || `https://${process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`}`;
+
+const DATA_DIR = path.join(__dirname, 'data');
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+const DB_FILE = path.join(DATA_DIR, 'subtitles.json');
+
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify([], null, 2));
+
+function readDb() {
+  return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+}
+
+function writeDb(data) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+}
+
+const storage = multer.diskStorage({
+  destination: (_, __, cb) => cb(null, UPLOAD_DIR),
+  filename: (_, file, cb) => {
+    const unique = Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+    cb(null, unique + path.extname(file.originalname).toLowerCase());
+  }
+});
+
+const upload = multer({
+  storage,
+  fileFilter: (_, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (['.srt', '.vtt', '.sub'].includes(ext)) cb(null, true);
+    else cb(new Error('Only .srt, .vtt, and .sub files are allowed'));
+  },
+  limits: {
+    fileSize: 5 * 1024 * 1024
+  }
+});
+
+app.use('/files', express.static(UPLOAD_DIR));
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.post('/upload', upload.single('subtitle'), (req, res) => {
+  try {
+    const { videoId, type, season, episode, lang, title } = req.body;
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'Subtitle file is required' });
+    }
+
+    if (!videoId || !type || !lang) {
+      return res.status(400).json({ error: 'videoId, type, and lang are required' });
+    }
+
+    if (!['movie', 'series'].includes(type)) {
+      return res.status(400).json({ error: 'type must be movie or series' });
+    }
+
+    if (type === 'series' && (!season || !episode)) {
+      return res.status(400).json({ error: 'season and episode are required for series' });
+    }
+
+    const db = readDb();
+    const item = {
+      id: Date.now().toString(),
+      videoId: videoId.trim(),
+      type,
+      season: type === 'series' ? Number(season) : null,
+      episode: type === 'series' ? Number(episode) : null,
+      lang: lang.trim().toLowerCase(),
+      title: title?.trim() || `${lang.trim()} subtitle`,
+      fileUrl: `${BASE_URL}/files/${req.file.filename}`,
+      originalName: req.file.originalname,
+      createdAt: new Date().toISOString()
+    };
+
+    db.push(item);
+    writeDb(db);
+
+    res.json({ success: true, item });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+app.get('/admin/subtitles', (req, res) => {
+  res.json(readDb());
+});
+
+const manifest = {
+  id: 'com.arena.customsubtitles',
+  version: '1.0.0',
+  name: 'Custom Uploaded Subtitles',
+  description: 'Upload your own subtitle files and use them in Stremio',
+  resources: ['subtitles'],
+  types: ['movie', 'series'],
+  idPrefixes: ['tt'],
+  catalogs: []
+};
+
+const builder = new addonBuilder(manifest);
+
+builder.defineSubtitlesHandler(async ({ id, type, extra = {} }) => {
+  const db = readDb();
+  const season = extra.season ? Number(extra.season) : null;
+  const episode = extra.episode ? Number(extra.episode) : null;
+
+  const matches = db.filter(item => {
+    if (item.videoId !== id) return false;
+    if (item.type !== type) return false;
+
+    if (type === 'series') {
+      return item.season === season && item.episode === episode;
+    }
+
+    return true;
+  });
+
+  return {
+    subtitles: matches.map(item => ({
+      id: item.id,
+      lang: item.lang,
+      title: item.title,
+      url: item.fileUrl
+    }))
+  };
+});
+
+app.get('/manifest.json', (req, res) => {
+  res.json(manifest);
+});
+
+app.get('/subtitles/:type/:id.json', async (req, res) => {
+  try {
+    const { type, id } = req.params;
+    const result = await builder.getInterface().get('subtitles', type, id, req.query);
+    res.json(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ subtitles: [] });
+  }
+});
+
+app.use((err, req, res, next) => {
+  if (err) {
+    return res.status(400).json({ error: err.message || 'Something went wrong' });
+  }
+  next();
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Manifest URL: ${BASE_URL}/manifest.json`);
+});
